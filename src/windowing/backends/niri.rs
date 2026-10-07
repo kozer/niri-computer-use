@@ -36,6 +36,8 @@ const OUTPUTS_REQUEST: &str = "\"Outputs\"";
 const OUTPUTS_CLI: &[&str] = &["msg", "--json", "outputs"];
 const WORKSPACES_REQUEST: &str = "\"Workspaces\"";
 const WORKSPACES_CLI: &[&str] = &["msg", "--json", "workspaces"];
+const LAYERS_REQUEST: &str = "\"Layers\"";
+const LAYERS_CLI: &[&str] = &["msg", "--json", "layers"];
 
 /// Transport labels used in `doctor` detail strings.
 const TRANSPORT_SOCKET: &str = "the niri IPC socket";
@@ -105,6 +107,28 @@ fn activate_window_blocking(window_id: u64) -> Result<()> {
             )),
         },
     }
+}
+
+/// A layer-shell surface: bars, wallpapers, launchers, notifications. niri
+/// reports no owning pid or geometry for these.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct LayerSurface {
+    pub namespace: String,
+    pub output: Option<String>,
+    pub layer: String,
+    pub keyboard_interactivity: String,
+}
+
+pub async fn list_layers() -> Result<Vec<LayerSurface>> {
+    tokio::task::spawn_blocking(|| {
+        parse_layers(request_value(LAYERS_REQUEST, LAYERS_CLI, "Layers")?.value)
+    })
+    .await
+    .context("niri layer listing task failed")?
+}
+
+fn parse_layers(value: Value) -> Result<Vec<LayerSurface>> {
+    serde_json::from_value(value).context("failed to parse the niri layer list")
 }
 
 fn list_windows_with_transport() -> Result<(Vec<WindowInfo>, &'static str)> {
@@ -557,6 +581,96 @@ impl NiriWindow {
     }
 }
 
+/// The output showing a window, in screenshot (capture) coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisibleOutput {
+    pub name: String,
+    pub rect: (i32, i32, u32, u32),
+}
+
+/// The output that is showing `window_id`, for windows whose own position niri
+/// does not report. niri sets `tile_pos_in_workspace_view` only for floating
+/// windows, so every tiled window needs this. `None` when the window's
+/// workspace is not the active one on its output, or output scales differ.
+pub async fn visible_output(window_id: u64) -> Result<Option<VisibleOutput>> {
+    tokio::task::spawn_blocking(move || {
+        let windows = request_value(WINDOWS_REQUEST, WINDOWS_CLI, "Windows")?.value;
+        let outputs = request_value(OUTPUTS_REQUEST, OUTPUTS_CLI, "Outputs")?.value;
+        let workspaces = request_value(WORKSPACES_REQUEST, WORKSPACES_CLI, "Workspaces")?.value;
+        Ok(visible_output_from(
+            window_id,
+            &windows,
+            &outputs,
+            &workspaces,
+        ))
+    })
+    .await
+    .context("niri output lookup task failed")?
+}
+
+fn visible_output_from(
+    window_id: u64,
+    windows: &Value,
+    outputs: &Value,
+    workspaces: &Value,
+) -> Option<VisibleOutput> {
+    #[derive(Deserialize)]
+    struct Window {
+        id: u64,
+        workspace_id: Option<u64>,
+        #[serde(default)]
+        is_minimized: bool,
+    }
+    #[derive(Deserialize)]
+    struct Workspace {
+        id: u64,
+        output: Option<String>,
+        #[serde(default)]
+        is_active: bool,
+    }
+    #[derive(Deserialize)]
+    struct Output {
+        logical: Option<Logical>,
+    }
+    #[derive(Deserialize)]
+    struct Logical {
+        x: i32,
+        y: i32,
+        width: f64,
+        height: f64,
+    }
+
+    let window = Vec::<Window>::deserialize(windows)
+        .ok()?
+        .into_iter()
+        .find(|window| window.id == window_id)?;
+    if window.is_minimized {
+        return None;
+    }
+    let workspace = Vec::<Workspace>::deserialize(workspaces)
+        .ok()?
+        .into_iter()
+        .find(|workspace| Some(workspace.id) == window.workspace_id)?;
+    if !workspace.is_active {
+        return None;
+    }
+    let name = workspace.output?;
+    let capture = NiriCaptureLayout::from_outputs(&parse_output_geometries(outputs))?;
+    let logical = BTreeMap::<String, Output>::deserialize(outputs)
+        .ok()?
+        .remove(&name)?
+        .logical?;
+    Some(VisibleOutput {
+        rect: (
+            capture.map_axis(f64::from(logical.x), capture.origin_x)?,
+            capture.map_axis(f64::from(logical.y), capture.origin_y)?,
+            capture.map_dimension(logical.width)?,
+            capture.map_dimension(logical.height)?,
+        ),
+        name,
+    })
+}
+
 fn positive_dimension(value: f64) -> Option<u32> {
     if !value.is_finite() || value <= 0.0 {
         return None;
@@ -581,6 +695,19 @@ fn round_coordinate(value: f64) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn layers_parse_from_niri_json() {
+        let value = serde_json::json!([
+            {"namespace":"vicinae","output":"HDMI-A-1","layer":"Overlay","keyboard_interactivity":"Exclusive"},
+            {"namespace":"noctalia-bar-main","output":null,"layer":"Top","keyboard_interactivity":"None"}
+        ]);
+        let layers = super::parse_layers(value).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].namespace, "vicinae");
+        assert_eq!(layers[0].keyboard_interactivity, "Exclusive");
+        assert_eq!(layers[1].output, None);
+    }
+
     use super::*;
 
     /// Trimmed capture of `niri msg --json windows` from a live niri 26.04
@@ -721,6 +848,52 @@ mod tests {
             assert_eq!(bounds.x, None, "window {} reported x", window.window_id);
             assert_eq!(bounds.y, None, "window {} reported y", window.window_id);
         }
+    }
+
+    #[test]
+    fn finds_the_output_showing_a_tiled_window() {
+        let windows = serde_json::json!([
+            {"id": 21, "workspace_id": 1, "is_minimized": false},
+            {"id": 6, "workspace_id": 2},
+            {"id": 3, "workspace_id": 6},
+        ]);
+        let outputs = serde_json::json!({
+            "HDMI-A-1": {"logical": {"x": 0, "y": 0, "width": 2560, "height": 1440, "scale": 1.0}},
+            "DP-4": {"logical": {"x": 2560, "y": 0, "width": 2560, "height": 1440, "scale": 1.0}},
+        });
+        let workspaces = serde_json::json!([
+            {"id": 1, "output": "HDMI-A-1", "is_active": true},
+            {"id": 2, "output": "HDMI-A-1", "is_active": false},
+            {"id": 6, "output": "DP-4", "is_active": true},
+        ]);
+        let visible = |id| visible_output_from(id, &windows, &outputs, &workspaces);
+
+        assert_eq!(
+            visible(21),
+            Some(VisibleOutput {
+                name: "HDMI-A-1".into(),
+                rect: (0, 0, 2560, 1440)
+            })
+        );
+        assert_eq!(visible(3).unwrap().rect, (2560, 0, 2560, 1440));
+        // Its workspace is not the one on screen, so no output shows it.
+        assert_eq!(visible(6), None);
+        assert_eq!(visible(99), None);
+    }
+
+    #[test]
+    fn output_rect_is_in_capture_pixels() {
+        let windows = serde_json::json!([{"id": 1, "workspace_id": 1}]);
+        let outputs = serde_json::json!({
+            "eDP-1": {"logical": {"x": 0, "y": 0, "width": 1280, "height": 800, "scale": 2.0}},
+        });
+        let workspaces = serde_json::json!([{"id": 1, "output": "eDP-1", "is_active": true}]);
+        assert_eq!(
+            visible_output_from(1, &windows, &outputs, &workspaces)
+                .unwrap()
+                .rect,
+            (0, 0, 2560, 1600)
+        );
     }
 
     #[test]

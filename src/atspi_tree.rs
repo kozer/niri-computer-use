@@ -594,6 +594,37 @@ pub(crate) async fn focus_element(object_ref_id: &str) -> Result<()> {
     Err(anyhow!("element focus verification failed"))
 }
 
+/// Select an element through its parent's AT-SPI Selection interface. Page
+/// tabs and list or tree items often expose no click action; selecting them
+/// this way needs no pointer coordinates. Verifies the Selected state.
+pub(crate) async fn select_in_parent(object_ref_id: &str) -> Result<()> {
+    let conn = connect().await?;
+    let object_ref = object_ref_from_id(object_ref_id)?;
+    let proxy = open_accessible(&conn, &object_ref).await?;
+    let index = proxy.get_index_in_parent().await?;
+    if index < 0 {
+        return Err(anyhow!("element reports no index in its parent"));
+    }
+    let parent_ref = proxy.parent().await?;
+    let parent = open_accessible(&conn, &parent_ref).await?;
+    let selection = parent
+        .proxies()
+        .await?
+        .selection()
+        .await
+        .context("parent has no AT-SPI Selection interface")?;
+    if !selection.select_child(index).await? {
+        return Err(anyhow!("AT-SPI Selection rejected the element"));
+    }
+    for _ in 0..10 {
+        if proxy.get_state().await?.contains(atspi::State::Selected) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(anyhow!("selection verification failed"))
+}
+
 pub(crate) async fn select_element_text(object_ref_id: &str, start: i32, end: i32) -> Result<()> {
     let conn = connect().await?;
     let object_ref = object_ref_from_id(object_ref_id)?;
