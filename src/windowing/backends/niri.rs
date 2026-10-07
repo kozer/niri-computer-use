@@ -590,9 +590,10 @@ pub struct VisibleOutput {
 
 /// The output that is showing `window_id`, for windows whose own position niri
 /// does not report. niri sets `tile_pos_in_workspace_view` only for floating
-/// windows, so every tiled window needs this. `None` when the window's
-/// workspace is not the active one on its output, or output scales differ.
-pub async fn visible_output(window_id: u64) -> Result<Option<VisibleOutput>> {
+/// windows, so every tiled window needs this. The error says why no output
+/// shows it: its workspace is not the one on screen, another column holds the
+/// view, or output scales differ.
+pub async fn visible_output(window_id: u64) -> Result<std::result::Result<VisibleOutput, String>> {
     tokio::task::spawn_blocking(move || {
         let windows = request_value(WINDOWS_REQUEST, WINDOWS_CLI, "Windows")?.value;
         let outputs = request_value(OUTPUTS_REQUEST, OUTPUTS_CLI, "Outputs")?.value;
@@ -613,7 +614,7 @@ fn visible_output_from(
     windows: &Value,
     outputs: &Value,
     workspaces: &Value,
-) -> Option<VisibleOutput> {
+) -> std::result::Result<VisibleOutput, String> {
     #[derive(Deserialize)]
     struct Window {
         id: u64,
@@ -627,6 +628,8 @@ fn visible_output_from(
         output: Option<String>,
         #[serde(default)]
         is_active: bool,
+        #[serde(default)]
+        active_window_id: Option<u64>,
     }
     #[derive(Deserialize)]
     struct Output {
@@ -641,34 +644,55 @@ fn visible_output_from(
     }
 
     let window = Vec::<Window>::deserialize(windows)
-        .ok()?
+        .map_err(|error| format!("unreadable niri windows: {error}"))?
         .into_iter()
-        .find(|window| window.id == window_id)?;
+        .find(|window| window.id == window_id)
+        .ok_or_else(|| format!("niri lists no window {window_id}"))?;
     if window.is_minimized {
-        return None;
+        return Err(format!("window {window_id} is minimized"));
     }
+    let workspace_id = window
+        .workspace_id
+        .ok_or_else(|| format!("window {window_id} has no workspace yet"))?;
     let workspace = Vec::<Workspace>::deserialize(workspaces)
-        .ok()?
+        .map_err(|error| format!("unreadable niri workspaces: {error}"))?
         .into_iter()
-        .find(|workspace| Some(workspace.id) == window.workspace_id)?;
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| format!("niri lists no workspace {workspace_id}"))?;
     if !workspace.is_active {
-        return None;
+        return Err(format!(
+            "window {window_id} is on workspace {workspace_id}, which is not the one on screen"
+        ));
     }
-    let name = workspace.output?;
-    let capture = NiriCaptureLayout::from_outputs(&parse_output_geometries(outputs))?;
+    // In the scrolling layout only the workspace's active column is sure to be
+    // in view; another column may be scrolled off the output.
+    if let Some(active) = workspace.active_window_id {
+        if active != window_id {
+            return Err(format!(
+                "window {window_id} is not the active window of workspace {workspace_id} (window {active} is)"
+            ));
+        }
+    }
+    let name = workspace
+        .output
+        .ok_or_else(|| format!("workspace {workspace_id} has no output"))?;
+    let unmapped = || format!("output {name} has no capture geometry (mixed scales?)");
+    let capture = NiriCaptureLayout::from_outputs(&parse_output_geometries(outputs)).ok_or_else(unmapped)?;
     let logical = BTreeMap::<String, Output>::deserialize(outputs)
-        .ok()?
-        .remove(&name)?
-        .logical?;
-    Some(VisibleOutput {
-        rect: (
+        .ok()
+        .and_then(|mut outputs| outputs.remove(&name))
+        .and_then(|output| output.logical)
+        .ok_or_else(unmapped)?;
+    let rect = (|| {
+        Some((
             capture.map_axis(f64::from(logical.x), capture.origin_x)?,
             capture.map_axis(f64::from(logical.y), capture.origin_y)?,
             capture.map_dimension(logical.width)?,
             capture.map_dimension(logical.height)?,
-        ),
-        name,
-    })
+        ))
+    })()
+    .ok_or_else(unmapped)?;
+    Ok(VisibleOutput { rect, name })
 }
 
 fn positive_dimension(value: f64) -> Option<u32> {
@@ -870,15 +894,34 @@ mod tests {
 
         assert_eq!(
             visible(21),
-            Some(VisibleOutput {
+            Ok(VisibleOutput {
                 name: "HDMI-A-1".into(),
                 rect: (0, 0, 2560, 1440)
             })
         );
         assert_eq!(visible(3).unwrap().rect, (2560, 0, 2560, 1440));
         // Its workspace is not the one on screen, so no output shows it.
-        assert_eq!(visible(6), None);
-        assert_eq!(visible(99), None);
+        assert!(visible(6).unwrap_err().contains("not the one on screen"));
+        assert!(visible(99).is_err());
+    }
+
+    #[test]
+    fn a_column_scrolled_out_of_view_is_not_visible() {
+        let windows = serde_json::json!([
+            {"id": 21, "workspace_id": 1},
+            {"id": 11, "workspace_id": 1},
+            {"id": 30, "workspace_id": 1, "is_minimized": true},
+        ]);
+        let outputs = serde_json::json!({
+            "HDMI-A-1": {"logical": {"x": 0, "y": 0, "width": 2560, "height": 1440, "scale": 1.0}},
+        });
+        let workspaces = serde_json::json!([
+            {"id": 1, "output": "HDMI-A-1", "is_active": true, "active_window_id": 21},
+        ]);
+        let visible = |id| visible_output_from(id, &windows, &outputs, &workspaces);
+        assert!(visible(21).is_ok());
+        assert!(visible(11).unwrap_err().contains("window 21 is"));
+        assert!(visible(30).unwrap_err().contains("minimized"));
     }
 
     #[test]

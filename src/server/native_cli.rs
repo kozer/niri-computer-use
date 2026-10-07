@@ -271,7 +271,13 @@ async fn execute(server: &ComputerUseLinux, tool: &str, arguments: Value) -> Res
 /// Flatten a content-bearing result into one JSON object: structured content
 /// or JSON text blocks become fields, images become files under `images`.
 fn content_result(result: Result<CallToolResult, ErrorData>) -> Result<Value> {
-    let result = result.map_err(|error| anyhow!("{}", error.message))?;
+    let result = match result {
+        Ok(result) => result,
+        // Bad argument values are a rejected request (exit 2); any other error
+        // means the tool ran and failed, which the contract reports as ok:false (exit 1).
+        Err(error) if error.code == rmcp::model::ErrorCode::INVALID_PARAMS => bail!("{}", error.message),
+        Err(error) => return Ok(json!({"ok": false, "error": error.message})),
+    };
     let mut merged = match result.structured_content {
         Some(Value::Object(map)) => map,
         Some(other) => serde_json::Map::from_iter([("result".to_string(), other)]),
@@ -541,5 +547,12 @@ mod tests {
         let path = value["images"][0]["path"].as_str().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"hello");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_errors_fail_the_tool_but_bad_params_reject_the_request() {
+        let failed = content_result(Err(ErrorData::internal_error("no output shows it", None))).unwrap();
+        assert_eq!(failed, json!({"ok": false, "error": "no output shows it"}));
+        assert!(content_result(Err(ErrorData::invalid_params("bad x", None))).is_err());
     }
 }
