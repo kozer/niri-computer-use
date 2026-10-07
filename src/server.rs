@@ -113,6 +113,9 @@ fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
     }
 }
 
+mod native_cli;
+pub(crate) use native_cli::run as run_native_cli;
+
 impl ComputerUseLinux {
     fn mcp_tool_router(&self) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
         self.router_with_completion(env::var(COMPLETION_ENABLE_ENV).as_deref() == Ok("1"))

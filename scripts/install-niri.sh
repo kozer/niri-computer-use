@@ -16,8 +16,16 @@ for task_binary in computer-use-linux niri-clipboard; do
   mv -f -- "$task_staging" "$task_data/bin/$task_binary"
 done
 install -m755 "$task_root/scripts/niri-desktop-session.py" "$task_data/bin/niri-desktop-session.py"
-codex plugin marketplace add "$task_root"
-codex plugin add niri-computer-use@niri-local
+# The native CLI (`computer-use-linux call|tools`) needs no registration; the
+# Codex MCP plugin is opt-in.
+if [ "${NIRI_REGISTER_CODEX:-0}" = 1 ]; then
+  codex plugin marketplace add "$task_root"
+  codex plugin add niri-computer-use@niri-local
+fi
 "$task_data/bin/computer-use-linux" setup
 "$task_data/bin/computer-use-linux" doctor
-echo 'Installed. Start a new Codex conversation to load the MCP tools.'
+if [ "${NIRI_REGISTER_CODEX:-0}" = 1 ]; then
+  echo 'Installed. Start a new Codex conversation to load the MCP tools.'
+else
+  echo "Installed $task_data/bin/computer-use-linux. Set NIRI_REGISTER_CODEX=1 to also register the Codex MCP plugin."
+fi

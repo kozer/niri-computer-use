@@ -127,13 +127,18 @@ pub(crate) async fn run_from_env() -> Result<()> {
             );
             Ok(())
         }
+        Some("call" | "tools" | "daemon" | "stop") => {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let code = server::run_native_cli(&args).await?;
+            std::process::exit(code);
+        }
         Some("--help") | Some("-h") => {
             print_help();
             Ok(())
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
+                "unknown command '{command}'. Expected one of: call, tools, daemon, stop, mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
             );
         }
         None => {
@@ -161,7 +166,7 @@ fn abs_test_report(
 fn print_help() {
     println!("guard-accessibility: explicit foreground accessibility hold-open; stop with Ctrl-C or SIGTERM before disabling accessibility.\n");
     println!(
-        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
+        "computer-use-linux\n\nUsage:\n  computer-use-linux tools [TOOL]\n  computer-use-linux call TOOL [JSON_ARGUMENTS] [--no-daemon]\n  computer-use-linux daemon\n  computer-use-linux stop\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
     );
 }
 
