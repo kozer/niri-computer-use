@@ -10,6 +10,7 @@ mod desktop_apps;
 mod diagnostics_impl;
 mod gnome_extension;
 mod identity;
+mod input_hold;
 mod keyboard;
 mod niri_pointer;
 mod remote_desktop;

@@ -334,10 +334,20 @@ impl ComputerUseLinux {
         let this = self.clone();
         let (_guard, result) = run_cancellation_safe_input(guard, async move {
             let target = params.target.window_target();
-            if !target.has_target() { return Err("paste requires an explicit window/app target".into()); }
+            if !target.has_target() {
+                return Err("paste requires an explicit window/app target".into());
+            }
             let key = params.key.as_deref().unwrap_or("Ctrl+V");
-            this.clipboard_paste_text(&target, &params.target.text, params.html.as_deref(), key, params.restore_delay_ms).await
-        }).await;
+            this.clipboard_paste_text(
+                &target,
+                &params.target.text,
+                params.html.as_deref(),
+                key,
+                params.restore_delay_ms,
+            )
+            .await
+        })
+        .await;
         Json(ActionOutput {
             ok: result.is_ok(),
             implemented: true,
@@ -925,7 +935,17 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn click(&self, Parameters(mut params): Parameters<ClickParams>) -> Json<ActionOutput> {
+    async fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
+        let mut hold = None;
+        let Json(output) = self.click_inner(params, &mut hold).await;
+        Json(finish_input_hold(output, hold))
+    }
+
+    async fn click_inner(
+        &self,
+        mut params: ClickParams,
+        hold: &mut Option<ActiveHold>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let mut portal_target_point = None;
@@ -1129,6 +1149,20 @@ impl ComputerUseLinux {
         let ClickTarget::Coordinates(x, y) = target else {
             unreachable!("click target must resolve to coordinates or an AT-SPI action");
         };
+        // Hold the user's input devices across the pointer move and button
+        // events so the pointer cannot be moved between positioning and clicking.
+        match begin_input_hold().await {
+            Ok(active) => *hold = Some(active),
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message,
+                    received,
+                });
+            }
+        }
         if env_contains("XDG_CURRENT_DESKTOP", "niri") {
             let button = match params.button.as_deref().unwrap_or("left") {
                 "left" | "primary" => 0x110,
@@ -1414,7 +1448,17 @@ impl ComputerUseLinux {
             open_world_hint = true
         )
     )]
-    async fn scroll(&self, Parameters(mut params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+    async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+        let mut hold = None;
+        let Json(output) = self.scroll_inner(params, &mut hold).await;
+        Json(finish_input_hold(output, hold))
+    }
+
+    async fn scroll_inner(
+        &self,
+        mut params: ScrollParams,
+        hold: &mut Option<ActiveHold>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let mut portal_target_point = None;
@@ -1593,6 +1637,20 @@ impl ComputerUseLinux {
             Some((x, y)) => self.off_screen_note_for_point(x, y).await,
             None => None,
         };
+        // Hold the user's input devices across the pointer move and button
+        // events so the pointer cannot be moved between positioning and clicking.
+        match begin_input_hold().await {
+            Ok(active) => *hold = Some(active),
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "scroll".to_string(),
+                    message,
+                    received,
+                });
+            }
+        }
         if env_contains("XDG_CURRENT_DESKTOP", "niri") {
             let (dx, dy) = match direction {
                 ScrollDirection::Up => (0, -units),
@@ -1753,6 +1811,16 @@ impl ComputerUseLinux {
         )
     )]
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
+        let mut hold = None;
+        let Json(output) = self.drag_inner(params, &mut hold).await;
+        Json(finish_input_hold(output, hold))
+    }
+
+    async fn drag_inner(
+        &self,
+        params: DragParams,
+        hold: &mut Option<ActiveHold>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         if let Some(window_id) = params.window_id {
@@ -1767,6 +1835,20 @@ impl ComputerUseLinux {
                     ok: false,
                     implemented: true,
                     action: "drag".into(),
+                    message,
+                    received,
+                });
+            }
+        }
+        // Hold the user's input devices across the pointer move and button
+        // events so the pointer cannot be moved between positioning and clicking.
+        match begin_input_hold().await {
+            Ok(active) => *hold = Some(active),
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "drag".to_string(),
                     message,
                     received,
                 });
@@ -1903,18 +1985,35 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<PressKeyParams>,
     ) -> Json<ActionOutput> {
         let mut expected = None;
-        let Json(output) = self.press_key_inner(params, &mut expected).await;
-        Json(with_post_input_focus_check(output, expected).await)
+        let mut hold = None;
+        let Json(output) = self.press_key_inner(params, &mut expected, &mut hold).await;
+        let output = with_post_input_focus_check(output, expected).await;
+        Json(finish_input_hold(output, hold))
     }
 
-    /// `expected` receives the window id input must still reach once delivered.
+    /// `expected` receives the window id input must still reach once delivered;
+    /// `hold` receives the input hold, which the caller releases after its
+    /// post-check.
     async fn press_key_inner(
         &self,
         params: PressKeyParams,
         expected: &mut Option<u64>,
+        hold: &mut Option<ActiveHold>,
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        match begin_input_hold().await {
+            Ok(active) => *hold = Some(active),
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "press_key".to_string(),
+                    message,
+                    received,
+                });
+            }
+        }
         let focus = match self.focus_target_for_input(&params.window_target()).await {
             Ok(focus) => focus,
             Err(message) => {
@@ -2109,11 +2208,14 @@ impl ComputerUseLinux {
             && !self.should_prefer_kde_clipboard_text_backend();
         if !chunkable {
             let mut expected = None;
-            let Json(output) = self.type_text_inner(params, &mut expected).await;
-            return Json(with_post_input_focus_check(output, expected).await);
+            let mut hold = None;
+            let Json(output) = self.type_text_inner(params, &mut expected, &mut hold).await;
+            let output = with_post_input_focus_check(output, expected).await;
+            return Json(finish_input_hold(output, hold));
         }
-        // Per-key typing: send one character at a time and re-read focus after
-        // each, so a window switch mid-text aborts the rest instead of typing into it.
+        // Chunked typing: one input hold per round covers check -> type ->
+        // post-check; rounds stay short, and a focus change the hold cannot
+        // prevent (app-initiated) aborts the rest of the text.
         let chunks = split_text_chunks(&params.text, TYPE_TEXT_FOCUS_CHUNK_CHARS);
         let total_chars = params.text.chars().count();
         let mut sent_chars = 0;
@@ -2122,9 +2224,12 @@ impl ComputerUseLinux {
             let mut chunk_params = params.clone();
             chunk_params.text = (*chunk).to_string();
             let mut expected = None;
-            let Json(output) = self.type_text_inner(chunk_params, &mut expected).await;
+            let mut hold = None;
+            let Json(output) = self
+                .type_text_inner(chunk_params, &mut expected, &mut hold)
+                .await;
             if !output.ok {
-                let mut output = output;
+                let mut output = finish_input_hold(output, hold);
                 if sent_chars > 0 {
                     output.message = format!(
                         "Typed {sent_chars} of {total_chars} characters before failing: {}",
@@ -2136,7 +2241,9 @@ impl ComputerUseLinux {
             }
             sent_chars += chunk.chars().count();
             let more = index + 1 < chunks.len();
-            if let Some(failure) = post_input_focus_failure(expected).await {
+            let failure = post_input_focus_failure(expected).await;
+            let output = finish_input_hold(output, hold);
+            if let Some(failure) = failure {
                 let mut output = output;
                 output.ok = false;
                 output.message = if more {
@@ -2157,11 +2264,13 @@ impl ComputerUseLinux {
     }
 
     /// `expected` receives the window id input must still reach once delivered
-    /// (clipboard paste checks focus itself).
+    /// (clipboard paste checks focus itself); `hold` receives the input hold
+    /// for the caller to release after its post-check.
     async fn type_text_inner(
         &self,
         params: TypeTextParams,
         expected: &mut Option<u64>,
+        hold: &mut Option<ActiveHold>,
     ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         if wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text) {
@@ -2171,10 +2280,13 @@ impl ComputerUseLinux {
             let target = params.window_target();
             let (_guard, result) = run_cancellation_safe_input(guard, async move {
                 let focus = this.focus_target_for_input(&target).await?;
-                let key = paste_chord_name(kde_clipboard_paste_shortcut(&target, focus.as_ref()).await);
+                let key =
+                    paste_chord_name(kde_clipboard_paste_shortcut(&target, focus.as_ref()).await);
                 this.clipboard_paste_text(&target, &text, None, key, None)
                     .await
-                    .map(|message| format!("Non-ASCII text sent through the clipboard ({key}). {message}"))
+                    .map(|message| {
+                        format!("Non-ASCII text sent through the clipboard ({key}). {message}")
+                    })
             })
             .await;
             return Json(ActionOutput {
@@ -2186,6 +2298,18 @@ impl ComputerUseLinux {
             });
         }
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
+        match begin_input_hold().await {
+            Ok(active) => *hold = Some(active),
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "type_text".to_string(),
+                    message,
+                    received,
+                });
+            }
+        }
         let window_target = params.window_target();
         let focus = match self.focus_target_for_input(&window_target).await {
             Ok(focus) => focus,
@@ -3522,20 +3646,36 @@ impl ComputerUseLinux {
         let previous = clipboard_helper("snapshot", None).await?;
         let offers = clipboard_offers(text, html);
         let offered = clipboard_helper("offer", Some(offers.to_string().into_bytes())).await;
+        let mut hold_status = None;
         let action = match offered {
-            Ok(_) => match self.focus_target_for_input(target).await {
-                Ok(focus) => {
-                    let result = self.send_niri_key(key).await;
-                    sleep(Duration::from_millis(restore_delay_ms.unwrap_or(500).clamp(100, 5000))).await;
-                    match result {
-                        Ok(()) => {
-                            let expected = exact_focus_expectation(target, focus.as_ref());
-                            match post_input_focus_failure(expected).await {
-                                Some(failure) => Err(failure),
-                                None => Ok(()),
+            Ok(_) => match begin_input_hold().await {
+                // The hold covers the focus check, the paste chord and the
+                // post-check, but not the clipboard restore delay below.
+                Ok(active) => {
+                    let delivered = match self.focus_target_for_input(target).await {
+                        Ok(focus) => match self.send_niri_key(key).await {
+                            Ok(()) => {
+                                let expected = exact_focus_expectation(target, focus.as_ref());
+                                match post_input_focus_failure(expected).await {
+                                    Some(failure) => Err(failure),
+                                    None => Ok(expected),
+                                }
                             }
-                        }
-                        error => error,
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    hold_status = Some(release_input_hold(active));
+                    sleep(Duration::from_millis(
+                        restore_delay_ms.unwrap_or(500).clamp(100, 5000),
+                    ))
+                    .await;
+                    match delivered {
+                        Ok(expected) => match post_input_focus_failure(expected).await {
+                            Some(failure) => Err(failure),
+                            None => Ok(()),
+                        },
+                        Err(error) => Err(error),
                     }
                 }
                 Err(error) => Err(error),
@@ -3544,7 +3684,7 @@ impl ComputerUseLinux {
         };
         let restored = clipboard_helper("offer", Some(previous)).await;
         match (action, restored) {
-            (Ok(()), Ok(_)) => Ok("Paste shortcut delivered; previous clipboard formats restored. Verify target contents with get_app_state.".to_string()),
+            (Ok(()), Ok(_)) => Ok(format!("Paste shortcut delivered; previous clipboard formats restored. Verify target contents with get_app_state.{}", hold_status.map(|status| format!(" {status}")).unwrap_or_default())),
             (Err(error), Ok(_)) => Err(error),
             (result, Err(error)) => Err(format!("{}; clipboard restoration failed: {error}", result.err().unwrap_or_else(|| "paste delivered".into()))),
         }
@@ -5254,7 +5394,12 @@ async fn niri_output_for_unplaced_window(
     crate::windowing::backends::niri::visible_output(window.window_id)
         .await?
         .map(Some)
-        .map_err(|reason| anyhow::anyhow!("niri reports no position for tiled window {} and no output shows it: {reason}", window.window_id))
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "niri reports no position for tiled window {} and no output shows it: {reason}",
+                window.window_id
+            )
+        })
 }
 
 fn output_scope_note(output: &str) -> String {
@@ -5537,10 +5682,81 @@ fn abs_pointer_clamp_note(landing: crate::abs_pointer::PointerLanding) -> Option
     })
 }
 
-/// Characters sent per round when typing under an exact-focus target. Focus is
-/// re-read before and after every round, so a user switching windows mid-text
-/// receives at most one stray character instead of the rest of the text.
-const TYPE_TEXT_FOCUS_CHUNK_CHARS: usize = 1;
+/// Characters sent per round when typing under an exact-focus target. Each round
+/// runs inside one input hold (bounding its duration) and focus is re-read after
+/// it, so an app-initiated focus change aborts the rest of the text.
+const TYPE_TEXT_FOCUS_CHUNK_CHARS: usize = 16;
+
+/// Serializes input holds: a second grab of the same devices would fail with
+/// EBUSY. Always taken after `input_operation_lock`, and never held while
+/// waiting for it.
+static INPUT_HOLD_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// An input hold in progress (or deliberately absent) plus its status line.
+struct ActiveHold {
+    hold: Option<crate::input_hold::InputHold>,
+    _serial: Option<tokio::sync::MutexGuard<'static, ()>>,
+    status: String,
+}
+
+/// Take the exclusive input hold. `Err` is the refusal message: input must not
+/// be sent when the hold cannot be taken. `COMPUTER_USE_LINUX_NO_INPUT_HOLD=1`
+/// opts out.
+async fn begin_input_hold() -> std::result::Result<ActiveHold, String> {
+    if env_flag_enabled("COMPUTER_USE_LINUX_NO_INPUT_HOLD") {
+        return Ok(ActiveHold {
+            hold: None,
+            _serial: None,
+            status: "Input hold disabled (COMPUTER_USE_LINUX_NO_INPUT_HOLD=1).".into(),
+        });
+    }
+    let serial = INPUT_HOLD_SERIAL.lock().await;
+    match tokio::task::spawn_blocking(crate::input_hold::InputHold::acquire).await {
+        Ok(Ok(hold)) => {
+            let status = match hold.device_count() {
+                0 => "Input hold skipped: no physical input devices.".to_string(),
+                count => format!("Input held on {count} physical devices."),
+            };
+            Ok(ActiveHold {
+                hold: Some(hold),
+                _serial: Some(serial),
+                status,
+            })
+        }
+        Ok(Err(error)) => Err(format!(
+            "Refusing to send input: could not take the exclusive input hold: {error:#}. Set COMPUTER_USE_LINUX_NO_INPUT_HOLD=1 to send without it."
+        )),
+        Err(error) => Err(format!(
+            "Refusing to send input: input hold task failed: {error}"
+        )),
+    }
+}
+
+/// Release the hold (ungrab, then replay the user's buffered input); returns
+/// its status line.
+fn release_input_hold(active: ActiveHold) -> String {
+    let expired = active.hold.as_ref().is_some_and(|hold| hold.expired());
+    let status = if expired {
+        format!(
+            "Input hold expired after {} s; this action was not fully protected from user focus changes.",
+            crate::input_hold::MAX_HOLD.as_secs()
+        )
+    } else {
+        active.status.clone()
+    };
+    drop(active);
+    status
+}
+
+/// Release the hold and append its status to the action message.
+fn finish_input_hold(mut output: ActionOutput, active: Option<ActiveHold>) -> ActionOutput {
+    let Some(active) = active else {
+        return output;
+    };
+    let status = release_input_hold(active);
+    output.message = format!("{} {status}", output.message);
+    output
+}
 
 /// The window id input must still be going to, or None when the target does not
 /// demand exact focus (or focus was not verified), so no post-check applies.
@@ -5632,7 +5848,9 @@ async fn window_list_output() -> ListWindowsOutput {
             let backend = window_backend(windows.iter());
             let note = registry::list_note(&backend);
             let layer_surfaces = if backend == crate::windowing::backends::niri::NIRI_BACKEND {
-                crate::windowing::backends::niri::list_layers().await.unwrap_or_default()
+                crate::windowing::backends::niri::list_layers()
+                    .await
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -7433,7 +7651,13 @@ mod tests {
 
     #[test]
     fn post_input_focus_check_names_the_window_now_focused() {
-        let other = Ok(Some(window_info(9, Some("Mail"), Some("thunderbird"), None, None)));
+        let other = Ok(Some(window_info(
+            9,
+            Some("Mail"),
+            Some("thunderbird"),
+            None,
+            None,
+        )));
         let message = focus_changed_during_input(7, &other).unwrap();
         assert!(message.contains("Focus changed during input"));
         assert!(message.contains("window_id 9"));
