@@ -26,8 +26,11 @@ pub async fn focus_window_target(target: &WindowTarget) -> Result<WindowFocusRes
 
     // niri focus-window can recenter its scrolling viewport even when this
     // window already has focus. Repeating it invalidates screenshot pixels.
+    // umbriel reports keyboard focus exactly, and per-key typing re-targets the
+    // window for every character, so skip the redundant activation there too.
     // Still query focus freshly below; cached focus is not input authorization.
-    if requested_window.backend != "niri" || !requested_window.focused {
+    let skip_when_focused = matches!(requested_window.backend.as_str(), "niri" | "umbriel");
+    if !skip_when_focused || !requested_window.focused {
         registry::activate_window(&requested_window).await?;
         if requested_window.backend == "niri" {
             tokio::time::sleep(Duration::from_millis(500)).await;
