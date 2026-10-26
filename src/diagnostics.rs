@@ -1,6 +1,6 @@
 use crate::windowing::registry::{
     self, COSMIC_WAYLAND_BACKEND, GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND,
-    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, NIRI_BACKEND, X11_BACKEND,
+    HYPRLAND_BACKEND, I3_BACKEND, KWIN_BACKEND, NIRI_BACKEND, UMBRIEL_BACKEND, X11_BACKEND,
 };
 use crate::ydotool;
 use schemars::JsonSchema;
@@ -351,6 +351,13 @@ fn capability_map_with_portal_keyboard(
     }
     if windowing.niri.ok {
         window_backends.push(NIRI_BACKEND.to_string());
+    }
+    if windowing
+        .backends
+        .get(UMBRIEL_BACKEND)
+        .is_some_and(|check| check.ok)
+    {
+        window_backends.push(UMBRIEL_BACKEND.to_string());
     }
     // i3 and the generic X11/EWMH backend have no dedicated
     // WindowingReport field; read them from the probe map so the capability

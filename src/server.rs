@@ -3743,9 +3743,13 @@ impl ComputerUseLinux {
             let window = resolve_window_target(&windows, target)?.clone();
             // A tiled niri window already on screen is captured through its
             // output, so it need not take focus from the user's window.
-            if !window.focused && niri_output_for_unplaced_window(&window).await?.is_none() {
+            if !window.focused
+                && niri_output_for_unplaced_window(&window).await?.is_none()
+                && !(window.backend == crate::windowing::backends::umbriel::UMBRIEL_BACKEND
+                    && crate::windowing::backends::umbriel::on_screen(window.window_id).await?)
+            {
                 anyhow::bail!(
-                    "raise_window=false requires the requested window to be focused or, on niri, on screen"
+                    "raise_window=false requires the requested window to be focused or, on niri or umbriel, on screen; this window is off screen (another workspace or scrolled out), so capturing it needs raise_window=true"
                 );
             }
             window

@@ -1,4 +1,4 @@
-use crate::windowing::backends::{cosmic, gnome, hyprland, i3, kwin, niri, x11};
+use crate::windowing::backends::{cosmic, gnome, hyprland, i3, kwin, niri, umbriel, x11};
 use crate::windowing::types::WindowInfo;
 use anyhow::{anyhow, Result};
 
@@ -8,9 +8,10 @@ pub use hyprland::HYPRLAND_BACKEND;
 pub use i3::I3_BACKEND;
 pub use kwin::KWIN_BACKEND;
 pub use niri::NIRI_BACKEND;
+pub use umbriel::UMBRIEL_BACKEND;
 pub use x11::X11_BACKEND;
 
-pub const WINDOW_PERMISSION_HINT: &str = "Computer Use could not access a supported window list backend. Targeted window input requires session-bus access plus GNOME Shell Introspect, the computer-use-linux GNOME Shell extension, the COSMIC Wayland helper, KWin/Plasma DBus scripting, Hyprland hyprctl, the niri IPC socket, or i3-msg. On GNOME, run setup_window_targeting to install the extension backend.";
+pub const WINDOW_PERMISSION_HINT: &str = "Computer Use could not access a supported window list backend. Targeted window input requires session-bus access plus GNOME Shell Introspect, the computer-use-linux GNOME Shell extension, the COSMIC Wayland helper, KWin/Plasma DBus scripting, Hyprland hyprctl, the niri IPC socket, the umbriel CLI, or i3-msg. On GNOME, run setup_window_targeting to install the extension backend.";
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackendDescriptor {
@@ -39,6 +40,7 @@ enum BackendKind {
     Kwin,
     Hyprland,
     Niri,
+    Umbriel,
     I3,
     X11,
 }
@@ -50,6 +52,7 @@ const BACKEND_ORDER: &[BackendKind] = &[
     BackendKind::Kwin,
     BackendKind::Hyprland,
     BackendKind::Niri,
+    BackendKind::Umbriel,
     BackendKind::I3,
     // Generic X11/EWMH: last, so a session-native backend always wins first.
     BackendKind::X11,
@@ -96,6 +99,13 @@ const DESCRIPTORS: &[BackendDescriptor] = &[
         failure_label: "niri",
         list_note: "Window list came from niri msg or its direct IPC fallback. Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
         missing_hint: "On niri, export the session's NIRI_SOCKET or expose an unambiguous matching socket in XDG_RUNTIME_DIR. The niri binary is optional.",
+        can_exact_focus: true,
+    },
+    BackendDescriptor {
+        id: UMBRIEL_BACKEND,
+        failure_label: "umbriel",
+        list_note: "Window list came from the umbriel CLI (umbriel windows --json). Terminal windows may include best-effort PTY and active-process context when the process tree is readable.",
+        missing_hint: "On umbriel, ensure the umbriel binary is on PATH and the compositor is running.",
         can_exact_focus: true,
     },
     BackendDescriptor {
@@ -196,6 +206,7 @@ async fn list_windows_for(backend: BackendKind) -> Result<Vec<WindowInfo>> {
         BackendKind::Kwin => kwin::list_windows().await,
         BackendKind::Hyprland => hyprland::list_windows().await,
         BackendKind::Niri => niri::list_windows().await,
+        BackendKind::Umbriel => umbriel::list_windows().await,
         BackendKind::I3 => i3::list_windows().await,
         BackendKind::X11 => x11::list_windows().await,
     }
@@ -221,6 +232,7 @@ pub async fn activate_window(window: &WindowInfo) -> Result<()> {
         KWIN_BACKEND => kwin::activate_window(window.window_id).await,
         HYPRLAND_BACKEND => hyprland::activate_window(window.window_id).await,
         NIRI_BACKEND => niri::activate_window(window.window_id).await,
+        UMBRIEL_BACKEND => umbriel::activate_window(window.window_id).await,
         I3_BACKEND => i3::activate_window(window.window_id).await,
         X11_BACKEND => x11::activate_window(window.window_id).await,
         backend => Err(anyhow!(
@@ -237,6 +249,7 @@ pub async fn focused_window_for_backend(backend: &str) -> Result<Option<WindowIn
         KWIN_BACKEND => kwin::list_windows().await?,
         HYPRLAND_BACKEND => hyprland::list_windows().await?,
         NIRI_BACKEND => niri::list_windows().await?,
+        UMBRIEL_BACKEND => umbriel::list_windows().await?,
         I3_BACKEND => i3::list_windows().await?,
         X11_BACKEND => x11::list_windows_for_exact_focus().await?,
         backend => {
@@ -284,6 +297,7 @@ pub fn probe_backends() -> Vec<BackendProbe> {
         kwin::probe(),
         hyprland::probe(),
         niri::probe(),
+        umbriel::probe(),
         i3::probe(),
         x11::probe(),
     ]
@@ -298,6 +312,7 @@ impl BackendKind {
             BackendKind::Kwin => KWIN_BACKEND,
             BackendKind::Hyprland => HYPRLAND_BACKEND,
             BackendKind::Niri => NIRI_BACKEND,
+            BackendKind::Umbriel => UMBRIEL_BACKEND,
             BackendKind::I3 => I3_BACKEND,
             BackendKind::X11 => X11_BACKEND,
         }

@@ -190,7 +190,7 @@ pub async fn capture_screenshot_raw() -> Result<RawScreenshotCapture> {
         return forced.capture().await;
     }
     if std::env::var("XDG_CURRENT_DESKTOP")
-        .is_ok_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("niri")))
+        .is_ok_and(|desktop| desktop.split(':').any(|d| d.eq_ignore_ascii_case("niri") || d.eq_ignore_ascii_case("umbriel")))
     {
         // niri 26.04's GNOME Screenshot shim allocates integer-scaled pixels
         // while its render elements retain fractional scale. That image cannot
