@@ -938,7 +938,7 @@ impl ComputerUseLinux {
     async fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let mut hold = None;
         let Json(output) = self.click_inner(params, &mut hold).await;
-        Json(finish_input_hold(output, hold))
+        Json(finish_input_hold(output, hold).await)
     }
 
     async fn click_inner(
@@ -1451,7 +1451,7 @@ impl ComputerUseLinux {
     async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
         let mut hold = None;
         let Json(output) = self.scroll_inner(params, &mut hold).await;
-        Json(finish_input_hold(output, hold))
+        Json(finish_input_hold(output, hold).await)
     }
 
     async fn scroll_inner(
@@ -1813,7 +1813,7 @@ impl ComputerUseLinux {
     async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
         let mut hold = None;
         let Json(output) = self.drag_inner(params, &mut hold).await;
-        Json(finish_input_hold(output, hold))
+        Json(finish_input_hold(output, hold).await)
     }
 
     async fn drag_inner(
@@ -1988,7 +1988,7 @@ impl ComputerUseLinux {
         let mut hold = None;
         let Json(output) = self.press_key_inner(params, &mut expected, &mut hold).await;
         let output = with_post_input_focus_check(output, expected).await;
-        Json(finish_input_hold(output, hold))
+        Json(finish_input_hold(output, hold).await)
     }
 
     /// `expected` receives the window id input must still reach once delivered;
@@ -2211,7 +2211,7 @@ impl ComputerUseLinux {
             let mut hold = None;
             let Json(output) = self.type_text_inner(params, &mut expected, &mut hold).await;
             let output = with_post_input_focus_check(output, expected).await;
-            return Json(finish_input_hold(output, hold));
+            return Json(finish_input_hold(output, hold).await);
         }
         // Chunked typing: one input hold per round covers check -> type ->
         // post-check; rounds stay short, and a focus change the hold cannot
@@ -2229,7 +2229,7 @@ impl ComputerUseLinux {
                 .type_text_inner(chunk_params, &mut expected, &mut hold)
                 .await;
             if !output.ok {
-                let mut output = finish_input_hold(output, hold);
+                let mut output = finish_input_hold(output, hold).await;
                 if sent_chars > 0 {
                     output.message = format!(
                         "Typed {sent_chars} of {total_chars} characters before failing: {}",
@@ -2242,7 +2242,7 @@ impl ComputerUseLinux {
             sent_chars += chunk.chars().count();
             let more = index + 1 < chunks.len();
             let failure = post_input_focus_failure(expected).await;
-            let output = finish_input_hold(output, hold);
+            let output = finish_input_hold(output, hold).await;
             if let Some(failure) = failure {
                 let mut output = output;
                 output.ok = false;
@@ -3665,7 +3665,7 @@ impl ComputerUseLinux {
                         },
                         Err(error) => Err(error),
                     };
-                    hold_status = Some(release_input_hold(active));
+                    hold_status = Some(release_input_hold(active).await);
                     sleep(Duration::from_millis(
                         restore_delay_ms.unwrap_or(500).clamp(100, 5000),
                     ))
@@ -4156,6 +4156,7 @@ impl ComputerUseLinux {
             return Ok(None);
         }
 
+        let before = focused_window().await.ok().flatten();
         let focus = focus_window_target(target).await.map_err(|error| {
             let error = format!("{error:#}");
             if let Some(hint) = window_permission_hint(&error) {
@@ -4164,6 +4165,7 @@ impl ComputerUseLinux {
                 format!("Did not send input because the target window could not be focused: {error}")
             }
         })?;
+        record_focus_before_input(before, focus.requested_window.window_id);
 
         if focus_satisfies_target(&focus, target) {
             Ok(Some(focus))
@@ -5732,9 +5734,74 @@ async fn begin_input_hold() -> std::result::Result<ActiveHold, String> {
     }
 }
 
+/// The window that had keyboard focus before an input action moved focus to its
+/// target. Input actions are serialized, so one slot suffices; it is cleared
+/// whenever an action finishes.
+static FOCUS_BEFORE_INPUT: std::sync::Mutex<Option<WindowInfo>> = std::sync::Mutex::new(None);
+
+/// Remember `before` unless it already was the target (a second focus within
+/// the same action must not overwrite the user's window with the target).
+fn record_focus_before_input(before: Option<WindowInfo>, target_window_id: u64) {
+    let Some(before) = before else {
+        return;
+    };
+    if before.window_id == target_window_id {
+        return;
+    }
+    if let Ok(mut slot) = FOCUS_BEFORE_INPUT.lock() {
+        *slot = Some(before);
+    }
+}
+
+fn take_focus_before_input() -> Option<WindowInfo> {
+    FOCUS_BEFORE_INPUT.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// Give focus back to the user's window while their devices are still held, so
+/// the replay of what they typed lands there and not in the agent's target.
+async fn return_focus_to_user(previous: Option<WindowInfo>) -> Option<String> {
+    let previous = previous?;
+    let current = focused_window().await.ok().flatten();
+    if current.is_some_and(|window| window.window_id == previous.window_id) {
+        return None;
+    }
+    if let Err(error) = registry::activate_window(&previous).await {
+        return Some(format!(
+            "The user typed during the action, but focus could not return to their window (window_id {}): {error:#}.",
+            previous.window_id
+        ));
+    }
+    for _ in 0..20 {
+        if focused_window()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|window| window.window_id == previous.window_id)
+        {
+            return Some(format!(
+                "The user typed during the action, so focus returned to their window (window_id {}); the target no longer has focus.",
+                previous.window_id
+            ));
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    Some(format!(
+        "The user typed during the action; focus was sent back to their window (window_id {}) but not confirmed.",
+        previous.window_id
+    ))
+}
+
 /// Release the hold (ungrab, then replay the user's buffered input); returns
-/// its status line.
-fn release_input_hold(active: ActiveHold) -> String {
+/// its status line. When the user pressed or moved anything during the hold,
+/// focus first returns to the window they were in.
+async fn release_input_hold(active: ActiveHold) -> String {
+    let previous = take_focus_before_input();
+    let user_active = active.hold.as_ref().is_some_and(|hold| hold.saw_user_input());
+    let returned = if user_active {
+        return_focus_to_user(previous).await
+    } else {
+        None
+    };
     let expired = active.hold.as_ref().is_some_and(|hold| hold.expired());
     let status = if expired {
         format!(
@@ -5745,15 +5812,19 @@ fn release_input_hold(active: ActiveHold) -> String {
         active.status.clone()
     };
     drop(active);
-    status
+    match returned {
+        Some(note) => format!("{status} {note}"),
+        None => status,
+    }
 }
 
 /// Release the hold and append its status to the action message.
-fn finish_input_hold(mut output: ActionOutput, active: Option<ActiveHold>) -> ActionOutput {
+async fn finish_input_hold(mut output: ActionOutput, active: Option<ActiveHold>) -> ActionOutput {
     let Some(active) = active else {
+        take_focus_before_input();
         return output;
     };
-    let status = release_input_hold(active);
+    let status = release_input_hold(active).await;
     output.message = format!("{} {status}", output.message);
     output
 }
@@ -7703,6 +7774,20 @@ mod tests {
         assert_eq!(split_text_chunks("abcd", 2), vec!["ab", "cd"]);
         assert_eq!(split_text_chunks("αβγ", 2), vec!["αβ", "γ"]);
         assert!(split_text_chunks("", 2).is_empty());
+    }
+
+    #[test]
+    fn focus_before_input_keeps_the_users_window_across_a_second_focus() {
+        take_focus_before_input();
+        let user = window_info(1, Some("user"), None, None, None);
+        let target = window_info(2, Some("target"), None, None, None);
+        record_focus_before_input(Some(user), 2);
+        // A second focus in the same action starts from the target itself.
+        record_focus_before_input(Some(target), 2);
+        assert_eq!(take_focus_before_input().map(|w| w.window_id), Some(1));
+        assert!(take_focus_before_input().is_none());
+        record_focus_before_input(None, 2);
+        assert!(take_focus_before_input().is_none());
     }
 
     fn window_info(

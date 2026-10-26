@@ -291,6 +291,7 @@ struct Drained {
 pub(crate) struct InputHold {
     stop: Arc<AtomicBool>,
     expired: Arc<AtomicBool>,
+    saw_input: Arc<AtomicBool>,
     thread: Option<JoinHandle<Drained>>,
     device_count: usize,
 }
@@ -318,10 +319,12 @@ impl InputHold {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let expired = Arc::new(AtomicBool::new(false));
+        let saw_input = Arc::new(AtomicBool::new(false));
         if targets.is_empty() {
             return Ok(Self {
                 stop,
                 expired,
+                saw_input,
                 thread: None,
                 device_count: 0,
             });
@@ -355,15 +358,20 @@ impl InputHold {
         let device_count = grabbed.len();
         let deadline = Instant::now() + MAX_HOLD;
         let thread = {
-            let (stop, expired) = (Arc::clone(&stop), Arc::clone(&expired));
+            let (stop, expired, saw) = (
+                Arc::clone(&stop),
+                Arc::clone(&expired),
+                Arc::clone(&saw_input),
+            );
             thread::Builder::new()
                 .name("input-hold".into())
-                .spawn(move || drain_until(grabbed, initial, &stop, &expired, deadline))
+                .spawn(move || drain_until(grabbed, initial, &stop, &expired, &saw, deadline))
                 .context("spawn input hold thread")?
         };
         Ok(Self {
             stop,
             expired,
+            saw_input,
             thread: Some(thread),
             device_count,
         })
@@ -372,6 +380,11 @@ impl InputHold {
     /// Physical devices currently grabbed (0 when none existed).
     pub(crate) fn device_count(&self) -> usize {
         self.device_count
+    }
+
+    /// True when the user pressed, released, or moved anything during the hold.
+    pub(crate) fn saw_user_input(&self) -> bool {
+        self.saw_input.load(Ordering::SeqCst)
     }
 
     /// True when the watchdog released the grab before the holder finished.
@@ -399,9 +412,13 @@ fn drain_until(
     mut events: Vec<RawEvent>,
     stop: &AtomicBool,
     expired: &AtomicBool,
+    saw_input: &AtomicBool,
     deadline: Instant,
 ) -> Drained {
     loop {
+        if !events.is_empty() {
+            saw_input.store(true, Ordering::SeqCst);
+        }
         if stop.load(Ordering::SeqCst) {
             break;
         }
