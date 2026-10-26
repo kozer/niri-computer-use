@@ -1902,6 +1902,17 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<PressKeyParams>,
     ) -> Json<ActionOutput> {
+        let mut expected = None;
+        let Json(output) = self.press_key_inner(params, &mut expected).await;
+        Json(with_post_input_focus_check(output, expected).await)
+    }
+
+    /// `expected` receives the window id input must still reach once delivered.
+    async fn press_key_inner(
+        &self,
+        params: PressKeyParams,
+        expected: &mut Option<u64>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         let input_guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
         let focus = match self.focus_target_for_input(&params.window_target()).await {
@@ -1916,6 +1927,7 @@ impl ComputerUseLinux {
                 });
             }
         };
+        *expected = exact_focus_expectation(&params.window_target(), focus.as_ref());
         let Some((chord_modifiers, chord_key)) = key_chord(&params.key) else {
             return Json(ActionOutput {
                 ok: false,
@@ -2090,6 +2102,67 @@ impl ComputerUseLinux {
         &self,
         Parameters(params): Parameters<TypeTextParams>,
     ) -> Json<ActionOutput> {
+        let target = params.window_target();
+        let chunkable = target.requires_exact_focus()
+            && params.text.chars().count() > TYPE_TEXT_FOCUS_CHUNK_CHARS
+            && !wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text)
+            && !self.should_prefer_kde_clipboard_text_backend();
+        if !chunkable {
+            let mut expected = None;
+            let Json(output) = self.type_text_inner(params, &mut expected).await;
+            return Json(with_post_input_focus_check(output, expected).await);
+        }
+        // Per-key typing: send in chunks and re-read focus after each, so a
+        // window switch mid-text aborts the rest instead of typing into it.
+        let chunks = split_text_chunks(&params.text, TYPE_TEXT_FOCUS_CHUNK_CHARS);
+        let total_chars = params.text.chars().count();
+        let mut sent_chars = 0;
+        let mut last = None;
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut chunk_params = params.clone();
+            chunk_params.text = (*chunk).to_string();
+            let mut expected = None;
+            let Json(output) = self.type_text_inner(chunk_params, &mut expected).await;
+            if !output.ok {
+                let mut output = output;
+                if sent_chars > 0 {
+                    output.message = format!(
+                        "Typed {sent_chars} of {total_chars} characters before failing: {}",
+                        output.message
+                    );
+                }
+                output.received = Some(serde_json::json!(params));
+                return Json(output);
+            }
+            sent_chars += chunk.chars().count();
+            let more = index + 1 < chunks.len();
+            if let Some(failure) = post_input_focus_failure(expected).await {
+                let mut output = output;
+                output.ok = false;
+                output.message = if more {
+                    format!(
+                        "{failure} Typing aborted after {sent_chars} of {total_chars} characters."
+                    )
+                } else {
+                    format!("{failure} All {total_chars} characters were sent.")
+                };
+                output.received = Some(serde_json::json!(params));
+                return Json(output);
+            }
+            last = Some(output);
+        }
+        let mut output = last.expect("chunkable text has at least one chunk");
+        output.received = Some(serde_json::json!(params));
+        Json(output)
+    }
+
+    /// `expected` receives the window id input must still reach once delivered
+    /// (clipboard paste checks focus itself).
+    async fn type_text_inner(
+        &self,
+        params: TypeTextParams,
+        expected: &mut Option<u64>,
+    ) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params.clone()));
         if wtype_needs_clipboard(self.should_prefer_wtype_keyboard(), &params.text) {
             let guard = Arc::clone(&self.input_operation_lock).lock_owned().await;
@@ -2126,6 +2199,7 @@ impl ComputerUseLinux {
                 });
             }
         };
+        *expected = exact_focus_expectation(&window_target, focus.as_ref());
         if self.should_prefer_kde_clipboard_text_backend() {
             match self.ensure_portal_keyboard_session().await {
                 Ok(Some(session)) => {
@@ -2145,6 +2219,7 @@ impl ComputerUseLinux {
                     } else {
                         focus.clone()
                     };
+                    *expected = exact_focus_expectation(&window_target, kde_focus.as_ref());
                     let paste_shortcut =
                         kde_clipboard_paste_shortcut(&window_target, kde_focus.as_ref()).await;
                     let _clipboard_guard = self.kde_clipboard_lock.lock().await;
@@ -3449,10 +3524,19 @@ impl ComputerUseLinux {
         let offered = clipboard_helper("offer", Some(offers.to_string().into_bytes())).await;
         let action = match offered {
             Ok(_) => match self.focus_target_for_input(target).await {
-                Ok(_) => {
+                Ok(focus) => {
                     let result = self.send_niri_key(key).await;
                     sleep(Duration::from_millis(restore_delay_ms.unwrap_or(500).clamp(100, 5000))).await;
-                    result
+                    match result {
+                        Ok(()) => {
+                            let expected = exact_focus_expectation(target, focus.as_ref());
+                            match post_input_focus_failure(expected).await {
+                                Some(failure) => Err(failure),
+                                None => Ok(()),
+                            }
+                        }
+                        error => error,
+                    }
                 }
                 Err(error) => Err(error),
             },
@@ -5453,6 +5537,87 @@ fn abs_pointer_clamp_note(landing: crate::abs_pointer::PointerLanding) -> Option
     })
 }
 
+/// Characters sent per round when typing under an exact-focus target. Focus is
+/// re-read between rounds so a user switching windows mid-text stops the input
+/// instead of letting the remainder land in their window.
+const TYPE_TEXT_FOCUS_CHUNK_CHARS: usize = 32;
+
+/// The window id input must still be going to, or None when the target does not
+/// demand exact focus (or focus was not verified), so no post-check applies.
+fn exact_focus_expectation(
+    target: &WindowTarget,
+    focus: Option<&WindowFocusResult>,
+) -> Option<u64> {
+    if !target.requires_exact_focus() {
+        return None;
+    }
+    focus.map(|focus| focus.requested_window.window_id)
+}
+
+/// Decide the post-input focus outcome. uinput input goes to whatever window has
+/// focus at delivery time, so a focus change after the pre-input check means the
+/// input may have landed elsewhere. Returns a failure message, or None when the
+/// expected window is still focused.
+fn focus_changed_during_input(
+    expected_window_id: u64,
+    current: &std::result::Result<Option<WindowInfo>, String>,
+) -> Option<String> {
+    match current {
+        Ok(Some(window)) if window.window_id == expected_window_id => None,
+        Ok(Some(window)) => Some(format!(
+            "Focus changed during input: target window_id {expected_window_id} is no longer focused. Input may have landed in window_id {} (app_id {:?}, title {:?}).",
+            window.window_id, window.app_id, window.title
+        )),
+        Ok(None) => Some(format!(
+            "Focus changed during input: target window_id {expected_window_id} is no longer focused and no window is focused now. Input may have landed elsewhere."
+        )),
+        Err(error) => Some(format!(
+            "Could not re-read the focused window after input to confirm delivery to target window_id {expected_window_id}: {error}. Input may have landed in a different window."
+        )),
+    }
+}
+
+/// Re-read the focused window after input; Some(message) means delivery to the
+/// expected window cannot be confirmed.
+async fn post_input_focus_failure(expected_window_id: Option<u64>) -> Option<String> {
+    let expected = expected_window_id?;
+    let current = focused_window().await.map_err(|error| format!("{error:#}"));
+    focus_changed_during_input(expected, &current)
+}
+
+/// Turn a successful ActionOutput into a failure when focus moved during input.
+async fn with_post_input_focus_check(
+    mut output: ActionOutput,
+    expected_window_id: Option<u64>,
+) -> ActionOutput {
+    if output.ok {
+        if let Some(failure) = post_input_focus_failure(expected_window_id).await {
+            output.ok = false;
+            output.message = format!("{failure} Original result: {}", output.message);
+        }
+    }
+    output
+}
+
+/// Split text into chunks of at most `max_chars` characters.
+fn split_text_chunks(text: &str, max_chars: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut count = 0;
+    for (index, _) in text.char_indices() {
+        if count == max_chars {
+            chunks.push(&text[start..index]);
+            start = index;
+            count = 0;
+        }
+        count += 1;
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
 fn focus_satisfies_target(focus: &WindowFocusResult, target: &WindowTarget) -> bool {
     if target.requires_exact_focus() {
         focus.exact_window_focused
@@ -7258,6 +7423,62 @@ mod tests {
         );
         assert_eq!((capture.width, capture.height), (100, 50));
         assert!(capture.resized);
+    }
+
+    #[test]
+    fn post_input_focus_check_passes_only_when_target_still_focused() {
+        let same = Ok(Some(window_info(7, Some("t"), Some("app"), None, None)));
+        assert_eq!(focus_changed_during_input(7, &same), None);
+    }
+
+    #[test]
+    fn post_input_focus_check_names_the_window_now_focused() {
+        let other = Ok(Some(window_info(9, Some("Mail"), Some("thunderbird"), None, None)));
+        let message = focus_changed_during_input(7, &other).unwrap();
+        assert!(message.contains("Focus changed during input"));
+        assert!(message.contains("window_id 9"));
+        assert!(message.contains("thunderbird"));
+        assert!(message.contains("Mail"));
+    }
+
+    #[test]
+    fn post_input_focus_check_reports_no_focus_and_backend_errors() {
+        let none = focus_changed_during_input(7, &Ok(None)).unwrap();
+        assert!(none.contains("no window is focused"));
+        let error = focus_changed_during_input(7, &Err("niri down".to_string())).unwrap();
+        assert!(error.contains("niri down"));
+        assert!(error.contains("Could not re-read"));
+    }
+
+    #[test]
+    fn exact_focus_expectation_requires_exact_target_and_verified_focus() {
+        let exact = WindowTarget {
+            window_id: Some(7),
+            ..Default::default()
+        };
+        let app_only = WindowTarget {
+            app_id: Some("app".into()),
+            ..Default::default()
+        };
+        let focus = WindowFocusResult {
+            requested_window: window_info(7, None, None, None, None),
+            focused_window: None,
+            exact_window_focused: true,
+            app_focused: true,
+            backend: "test".to_string(),
+            note: String::new(),
+        };
+        assert_eq!(exact_focus_expectation(&exact, Some(&focus)), Some(7));
+        assert_eq!(exact_focus_expectation(&exact, None), None);
+        assert_eq!(exact_focus_expectation(&app_only, Some(&focus)), None);
+    }
+
+    #[test]
+    fn split_text_chunks_respects_char_boundaries() {
+        assert_eq!(split_text_chunks("abcde", 2), vec!["ab", "cd", "e"]);
+        assert_eq!(split_text_chunks("abcd", 2), vec!["ab", "cd"]);
+        assert_eq!(split_text_chunks("αβγ", 2), vec!["αβ", "γ"]);
+        assert!(split_text_chunks("", 2).is_empty());
     }
 
     fn window_info(
