@@ -34,8 +34,12 @@ struct UmbrielWindow {
     output: String,
     #[serde(default)]
     workspace: String,
+    /// Focused within its workspace; every output has one such window.
     #[serde(default)]
     focused: bool,
+    /// Holds keyboard focus: true for at most one window.
+    #[serde(default)]
+    active: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,7 +152,7 @@ fn list_windows_blocking() -> Result<Vec<WindowInfo>> {
                     .rsplit(':')
                     .next()
                     .and_then(|index| index.parse().ok()),
-                focused: window.focused,
+                focused: window.active,
                 hidden: false,
                 client_type: None,
                 backend: UMBRIEL_BACKEND.to_string(),
@@ -215,9 +219,12 @@ mod tests {
     fn reads_windows_from_a_live_capture() {
         let json = r#"[{"app_id":"kitty","title":"t","pid":7,"x":8,"y":56,"w":2544,"h":1376,
             "output":"HDMI-A-1","workspace":"HDMI-A-1:1","focused":true,"visible":true,
-            "id":"b57e6b30dcd2e5bf12681fa3eeb89394","extra":1}]"#;
+            "active":true,"id":"b57e6b30dcd2e5bf12681fa3eeb89394","extra":1},
+            {"app_id":"org.keepassxc.KeePassXC","title":"k","output":"DP-4","workspace":"DP-4:1",
+            "focused":true,"active":false,"id":"9589cd3bc1abd8dd495fc679104ee209"}]"#;
         let windows: Vec<UmbrielWindow> = serde_json::from_str(json).unwrap();
         assert_eq!(windows[0].w, 2544);
-        assert!(windows[0].focused);
+        // Each output reports a focused window; only `active` marks keyboard focus.
+        assert!(windows[0].active && windows[1].focused && !windows[1].active);
     }
 }
